@@ -8,7 +8,7 @@ Unlike heavier alternatives, this tool focuses on pure performance, minimal RAM 
 
 ---
 
-## ✨ Key Features
+## Key Features
 
 - **Plug & Play Support:** Automatic detection of DualSense and DS4 (v1 & v2) controllers.
 - **Xbox 360 Emulation:** Full compatibility with all Windows games and PC Game Pass.
@@ -33,7 +33,7 @@ To run the mapper, your system must have the following:
   - `hidapi.dll`
 - **OS:** Windows 10 or 11 (64-bit).
 
-## 🚀 Installation & Usage
+## Installation & Usage
 
 1. Download the latest package from the **Releases** section.
 2. Extract the contents to a folder of your choice.
@@ -59,15 +59,10 @@ nim c -d:release --app:gui --mm:arc dss.nim
 - **False Positives:** Some Antivirus software may flag the executable. This is common for Nim programs that interact with the Windows Registry (for startup) and simulate hardware input. The code is open-source and can be audited.
 - **Input Conflict:** It is recommended not to use this tool alongside DS4Windows or Steam Input to avoid "Double Input" issues.
 
-## 🔮 Future Developments
+## Future Developments
 
+- **Multi device support:** Add support for multiple controllers to be mapped simultaneously.
 - **Touchpad-to-Mouse:** Full implementation to use the controller's trackpad to move the mouse cursor and perform left/right clicks.
 - **Adaptive Trigger Support:** Add support for the Adaptive Triggers found on the DualSense controller.
 - **Controller Mapping:** Allow users to customize the mapping of keys to the controller buttons.
 - **GUI Interface:** Add a simple GUI interface to manage the service settings?
-
-## 🤝 Contributions
-
-Pull requests are welcome! If you find a bug or have an idea for a new feature (such as Adaptive Trigger support), please open an Issue.
-
-*Created with ❤️ using Nim.*
