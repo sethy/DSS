@@ -116,6 +116,13 @@ proc vigem_target_remove*(client: PVIGEM_CLIENT, target: PVIGEM_TARGET) {.stdcal
 proc vigem_target_free*(target: PVIGEM_TARGET) {.stdcall, dynlib: ViGEmClientDll, importc.}
 proc vigem_target_x360_update*(client: PVIGEM_CLIENT, target: PVIGEM_TARGET, report: XUSB_REPORT): VIGEM_ERROR {.stdcall, dynlib: ViGEmClientDll, importc.}
 
+# ViGEm Force Feedback (notification callback)
+type
+  X360_NOTIFICATION_CALLBACK* = proc(client: PVIGEM_CLIENT, target: PVIGEM_TARGET, largeMotor: uint8, smallMotor: uint8, ledNumber: uint8, userData: pointer) {.stdcall.}
+
+proc vigem_target_x360_register_notification*(client: PVIGEM_CLIENT, target: PVIGEM_TARGET, notification: X360_NOTIFICATION_CALLBACK, userData: pointer): VIGEM_ERROR {.stdcall, dynlib: ViGEmClientDll, importc.}
+proc vigem_target_x360_unregister_notification*(target: PVIGEM_TARGET) {.stdcall, dynlib: ViGEmClientDll, importc.}
+
 # --- HIDAPI Constants and Types ---
 const HidApiDll = "hidapi.dll"
 
@@ -230,6 +237,20 @@ var
   clickActive = false
   clickStartX = 0
   clickStartY = 0
+
+# Rumble/Force Feedback state
+var
+  currentLargeMotor: uint8 = 0
+  currentSmallMotor: uint8 = 0
+  lastRumbleSendTime: float = 0
+  rumbleCheckCounter: int = 0
+  controllerIsBT: bool = false   # Stored when device is opened
+
+# Force Feedback callback (chiamato da thread interno ViGEmClient)
+var
+  rumblePendingLargeMotor: uint8 = 0
+  rumblePendingSmallMotor: uint8 = 0
+  rumblePendingFlag: bool = false
 
 proc handleTouchpad(data: array[100, uint8], touchOffset: int, touchClick: bool) =
   # --- Legge il touch count (byte 33 per DS4, 31 per DualSense) ---
@@ -439,6 +460,49 @@ proc parseMacAddress(macStr: string): uint64 =
   except:
     result = 0
 
+proc sendRumbleToDS4(dev: hid_device, cType: ControllerType, isBluetooth: bool, largeMotor, smallMotor: uint8) =
+  ## Invia il force feedback (rumble) al controller DS4 fisico.
+  ## largeMotor = motore lento/sinistro (0-255)
+  ## smallMotor = motore veloce/destro (0-255)
+  if cType == ControllerType.DS4:
+    if isBluetooth:
+      var btRep: array[78, uint8]
+      btRep[0] = 0x11
+      btRep[1] = 0x80
+      btRep[3] = 0xFF
+      btRep[6] = smallMotor   # Right/fast motor
+      btRep[7] = largeMotor    # Left/slow motor
+      # LED lightbar (default: DS4 blue glow, personalizzabile in futuro)
+      btRep[8] = 0    # R
+      btRep[9] = 0    # G
+      btRep[10] = 64  # B (64 = intensità medio-bassa, evita abbagliamento)
+      
+      let devObj = cast[HidDevicePtr](dev)
+      let hHandle = devObj.device_handle
+      discard HidD_SetOutputReport(hHandle, addr btRep[0], int32(sizeof(btRep)))
+    else:
+      var usbRep: array[32, uint8]
+      usbRep[0] = 0x05
+      usbRep[1] = 0xFF
+      usbRep[4] = smallMotor   # Right/fast motor
+      usbRep[5] = largeMotor    # Left/slow motor
+      # LED lightbar
+      usbRep[6] = 0    # R
+      usbRep[7] = 0    # G
+      usbRep[8] = 64  # B
+      # no flash (sempre acceso)
+      usbRep[9] = 0   # Flash on
+      usbRep[10] = 0  # Flash off
+      
+      discard hid_write(dev, addr usbRep[0], csize_t(sizeof(usbRep)))
+    lastRumbleSendTime = epochTime()
+
+# Callback chiamata da ViGEmClient quando il gioco invia force feedback
+proc rumbleNotificationCallback(client: PVIGEM_CLIENT, target: PVIGEM_TARGET, largeMotor: uint8, smallMotor: uint8, ledNumber: uint8, userData: pointer) {.stdcall.} =
+  rumblePendingLargeMotor = largeMotor
+  rumblePendingSmallMotor = smallMotor
+  rumblePendingFlag = true
+
 proc wakeupController(dev: hid_device, cType: ControllerType, isBluetooth: bool) =
   if cType == ControllerType.DS4:
     if isBluetooth:
@@ -447,6 +511,10 @@ proc wakeupController(dev: hid_device, cType: ControllerType, isBluetooth: bool)
       btRep[0] = 0x11     # HID report ID per BT
       btRep[1] = 0x80     # Flags: enable rumble/LED
       btRep[3] = 0xFF     # Flags: enable tutto
+      # LED lightbar default (DS4 blue)
+      btRep[8] = 0    # R
+      btRep[9] = 0    # G
+      btRep[10] = 64  # B
       
       # Output report via control pipe (HidD_SetOutputReport)
       let devObj = cast[HidDevicePtr](dev)
@@ -460,6 +528,10 @@ proc wakeupController(dev: hid_device, cType: ControllerType, isBluetooth: bool)
       var usbRep: array[32, uint8]
       usbRep[0] = 0x05
       usbRep[1] = 0xFF
+      # LED lightbar default (DS4 blue)
+      usbRep[6] = 0    # R
+      usbRep[7] = 0    # G
+      usbRep[8] = 64  # B
       discard hid_write(dev, addr usbRep[0], csize_t(sizeof(usbRep)))
     
     # Metodo feature report 0x02 (legacy)
@@ -579,7 +651,10 @@ proc mappingThreadFunc() {.thread.} =
   if addRes != 0 and addRes != 0x20000000:
     logMsg("ERROR: Failed to add virtual Xbox 360 controller. Error code: " & $addRes)
     return
+  # Registra la callback per ricevere il force feedback
+  discard vigem_target_x360_register_notification(client, target, rumbleNotificationCallback, nil)
   defer:
+    vigem_target_x360_unregister_notification(target)
     vigem_target_remove(client, target)
     vigem_target_free(target)
   
@@ -614,12 +689,14 @@ proc mappingThreadFunc() {.thread.} =
             dev = hid_open_path(cur.path)
             if dev != nil:
               cType = ControllerType.DS4
+              controllerIsBT = isBT
               wakeupController(dev, cType, isBT)
               break
           elif cur.product_id == PID_DUALSENSE:
             dev = hid_open_path(cur.path)
             if dev != nil:
               cType = ControllerType.DualSense
+              controllerIsBT = isBT
               wakeupController(dev, cType, isBT)
               break
           cur = cur.next
@@ -638,6 +715,11 @@ proc mappingThreadFunc() {.thread.} =
       dev = nil
       cType = ControllerType.Unknown
       deviceChanged = true
+      # Reset rumble state per il prossimo controller
+      currentLargeMotor = 0
+      currentSmallMotor = 0
+      lastRumbleSendTime = 0
+      rumbleCheckCounter = 0
       continue
     elif bytesRead > 0:
       # Parse data based on controller type
@@ -664,11 +746,34 @@ proc mappingThreadFunc() {.thread.} =
         dev = nil
         cType = ControllerType.Unknown
         deviceChanged = true
+        # Reset rumble state
+        currentLargeMotor = 0
+        currentSmallMotor = 0
+        lastRumbleSendTime = 0
+        rumbleCheckCounter = 0
         os.sleep(2000) # Pause to avoid immediate reconnection if buttons are still pressed
         continue
       
       # Send updated state to virtual Xbox 360 controller
       discard vigem_target_x360_update(client, target, report)
+      
+      # Controlla se la callback ha ricevuto nuovi valori di force feedback
+      if rumblePendingFlag:
+        rumblePendingFlag = false
+        let lm = rumblePendingLargeMotor
+        let sm = rumblePendingSmallMotor
+        if lm != currentLargeMotor or sm != currentSmallMotor:
+          currentLargeMotor = lm
+          currentSmallMotor = sm
+          sendRumbleToDS4(dev, cType, controllerIsBT, currentLargeMotor, currentSmallMotor)
+      
+      # Riavvio periodico del rumble ogni ~4s se attivo (firmware DS4 spegne dopo ~5s)
+      rumbleCheckCounter += 1
+      if rumbleCheckCounter >= 100:
+        rumbleCheckCounter = 0
+        let rumbleActive = currentLargeMotor > 0 or currentSmallMotor > 0
+        if rumbleActive and (epochTime() - lastRumbleSendTime > 4.0):
+          sendRumbleToDS4(dev, cType, controllerIsBT, currentLargeMotor, currentSmallMotor)
     else:
       # Timeout reached (no new data), keep loop active
       discard
