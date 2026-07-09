@@ -213,6 +213,10 @@ proc mapAnalog(val: uint8): int16 =
   # Map range 0-255 to -32768 to 32767
   result = cast[int16]((int32(val) * 257) - 32768)
 
+const
+  touchpadSensitivity = 0.7     # Modificabile: 0.5 = metà velocità, 1.0 = normale, 2.0 = doppio
+  touchpadClickDeadzone = 12    # Pixel touch ignorati durante il click (evita movimenti accidentali)
+
 var
   lastTouchX = 0
   lastTouchY = 0
@@ -223,7 +227,9 @@ var
   rightClickActive = false
   touchRemainderX = 0.0
   touchRemainderY = 0.0
-  touchSensitivity = 1.5
+  clickActive = false
+  clickStartX = 0
+  clickStartY = 0
 
 proc handleTouchpad(data: array[100, uint8], touchOffset: int, touchClick: bool) =
   # --- Legge il touch count (byte 33 per DS4, 31 per DualSense) ---
@@ -238,12 +244,18 @@ proc handleTouchpad(data: array[100, uint8], touchOffset: int, touchClick: bool)
     else:
       clickMouse(MOUSEEVENTF_LEFTDOWN)
       rightClickActive = false
+    # Attiva deadzone: evita movimenti accidentali durante il clic
+    if touchCount > 0:
+      clickActive = true
+      clickStartX = int(data[touchOffset + 1]) + ((int(data[touchOffset + 2]) and 0x0F) * 255)
+      clickStartY = ((int(data[touchOffset + 2]) and 0xF0) shr 4) + (int(data[touchOffset + 3]) * 16)
   elif not touchClick and lastTouchClick:
     if rightClickActive:
       clickMouse(MOUSEEVENTF_RIGHTUP)
       rightClickActive = false
     else:
       clickMouse(MOUSEEVENTF_LEFTUP)
+    clickActive = false
   lastTouchClick = touchClick
 
   # --- Se touchCount = 0, non ci sono tocchi → resetta stati ed esce ---
@@ -272,17 +284,25 @@ proc handleTouchpad(data: array[100, uint8], touchOffset: int, touchClick: bool)
       let rawDy = int32(currentY1 - lastTouchY)
 
       if (rawDx != 0 or rawDy != 0) and not touch2Active:
-        var xMotion = float(rawDx) * touchSensitivity + touchRemainderX
-        var yMotion = float(rawDy) * touchSensitivity + touchRemainderY
-
-        let xAction = int32(xMotion)
-        let yAction = int32(yMotion)
-
-        touchRemainderX = xMotion - float(xAction)
-        touchRemainderY = yMotion - float(yAction)
-
-        if xAction != 0 or yAction != 0:
-          moveMouse(xAction, yAction)
+        # Click deadzone: durante il click ignora piccoli movimenti accidentali
+        var shouldMove = true
+        if clickActive:
+          let totalDx = abs(currentX1 - clickStartX)
+          let totalDy = abs(currentY1 - clickStartY)
+          if totalDx < touchpadClickDeadzone and totalDy < touchpadClickDeadzone:
+            shouldMove = false # Ancora nella deadzone, non muovere il cursore
+          else:
+            clickActive = false # Uscito dalla deadzone
+        
+        if shouldMove:
+          var xMotion = float(rawDx) * touchpadSensitivity + touchRemainderX
+          var yMotion = float(rawDy) * touchpadSensitivity + touchRemainderY
+          let xAction = int32(xMotion)
+          let yAction = int32(yMotion)
+          touchRemainderX = xMotion - float(xAction)
+          touchRemainderY = yMotion - float(yAction)
+          if xAction != 0 or yAction != 0:
+            moveMouse(xAction, yAction)
     else:
       touchRemainderX = 0.0
       touchRemainderY = 0.0
@@ -634,7 +654,7 @@ proc mappingThreadFunc() {.thread.} =
         continue # Ignore non-standard reports (e.g. calibration, battery)
         
       if closeAppMacro:
-        logMsg("PS + Circle detected. Disconnecting controller and closing app...")
+        #logMsg("PS + Circle detected. Disconnecting controller and closing app...")
         disconnectController(dev, cType)
         runMapping = false
         quit(0)
