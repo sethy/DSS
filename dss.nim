@@ -11,6 +11,12 @@ type
   LPARAM = int
   LRESULT = int
   WNDPROC = proc(hwnd: HWND, uMsg: UINT, wParam: WPARAM, lParam: LPARAM): LRESULT {.stdcall.}
+  HIDDeviceObj = object
+    device_handle: int
+    read_pending: bool
+    read_buf: pointer
+    ol: pointer
+  HidDevicePtr = ptr HIDDeviceObj
 
   WNDCLASSA {.pure.} = object
     style: UINT
@@ -148,24 +154,49 @@ type
 
 proc DeviceIoControl(hDevice: int, dwIoControlCode: uint32, lpInBuffer: pointer, nInBufferSize: int32, lpOutBuffer: pointer, nOutBufferSize: int32, lpBytesReturned: ptr int32, lpOverlapped: pointer): int32 {.stdcall, dynlib: "kernel32", importc.}
 proc CloseHandle(hObject: int): int32 {.stdcall, dynlib: "kernel32", importc.}
+proc GetLastError(): int32 {.stdcall, dynlib: "kernel32", importc.}
+proc HidD_SetOutputReport(hidDeviceObject: int, reportBuffer: pointer, reportBufferLength: int32): bool {.stdcall, dynlib: "hid.dll", importc.}
+
 proc BluetoothFindFirstRadio(pbtfrp: ptr BLUETOOTH_FIND_RADIO_PARAMS, phRadio: ptr int): int {.stdcall, dynlib: "bthprops.cpl", importc.}
 proc BluetoothFindRadioClose(hFind: int): int32 {.stdcall, dynlib: "bthprops.cpl", importc.}
 
-# --- Mouse API ---
-const
-  MOUSEEVENTF_MOVE = 0x0001
-  MOUSEEVENTF_LEFTDOWN = 0x0002
-  MOUSEEVENTF_LEFTUP = 0x0004
-  MOUSEEVENTF_RIGHTDOWN = 0x0008
-  MOUSEEVENTF_RIGHTUP = 0x0010
+# --- SendInput Mouse API (come DS4Windows) ---
+type
+  MOUSEINPUT {.pure.} = object
+    dx: int32
+    dy: int32
+    mouseData: uint32
+    flags: uint32
+    time: uint32
+    extraInfo: pointer
 
-proc mouse_event(dwFlags: uint32, dx: int32, dy: int32, dwData: uint32, dwExtraInfo: pointer) {.stdcall, dynlib: "user32", importc.}
+  INPUT {.pure.} = object
+    inputType: uint32
+    mi: MOUSEINPUT
+
+const
+  INPUT_MOUSE = 0'u32
+  MOUSEEVENTF_MOVE = 0x0001'u32
+  MOUSEEVENTF_LEFTDOWN = 0x0002'u32
+  MOUSEEVENTF_LEFTUP = 0x0004'u32
+  MOUSEEVENTF_RIGHTDOWN = 0x0008'u32
+  MOUSEEVENTF_RIGHTUP = 0x0010'u32
+
+proc SendInput(cInputs: uint32, pInputs: ptr INPUT, cbSize: int32): uint32 {.stdcall, dynlib: "user32", importc.}
 
 proc moveMouse(dx, dy: int32) =
-  mouse_event(MOUSEEVENTF_MOVE, dx, dy, 0, nil)
+  var inp: INPUT
+  inp.inputType = INPUT_MOUSE
+  inp.mi.flags = MOUSEEVENTF_MOVE
+  inp.mi.dx = dx
+  inp.mi.dy = dy
+  discard SendInput(1, addr inp, cast[int32](sizeof(inp)))
 
 proc clickMouse(flags: uint32) =
-  mouse_event(flags, 0, 0, 0, nil)
+  var inp: INPUT
+  inp.inputType = INPUT_MOUSE
+  inp.mi.flags = flags
+  discard SendInput(1, addr inp, cast[int32](sizeof(inp)))
 
 # --- Controller Logic ---
 type
@@ -186,46 +217,25 @@ var
   lastTouchX = 0
   lastTouchY = 0
   lastTouchActive = false
+  lastTouchActive2 = false
   lastTouchID = 0'u8
   lastTouchClick = false
   rightClickActive = false
+  touchRemainderX = 0.0
+  touchRemainderY = 0.0
+  touchSensitivity = 1.5
 
 proc handleTouchpad(data: array[100, uint8], touchOffset: int, touchClick: bool) =
-  let touch1Active = (data[touchOffset] and 0x80) == 0
-  let touch1ID = data[touchOffset] and 0x7F
+  # --- Legge il touch count (byte 33 per DS4, 31 per DualSense) ---
+  let touchCount = data[touchOffset - 2]
   
-  let touch2Active = (data[touchOffset + 4] and 0x80) == 0
-  
-  if touch1Active:
-    let currentX = int(data[touchOffset + 1]) or ((int(data[touchOffset + 2]) and 0x0F) shl 8)
-    let currentY = ((int(data[touchOffset + 2]) and 0xF0) shr 4) or (int(data[touchOffset + 3]) shl 4)
-    
-    if lastTouchActive and lastTouchID == touch1ID:
-      let dx = int32(currentX - lastTouchX)
-      let dy = int32(currentY - lastTouchY)
-      
-      # Base sensitivity (1:1 with screen pixels)
-      if dx != 0 or dy != 0:
-        # Move mouse only if there is a single finger on the touchpad
-        if not touch2Active:
-          # Sensitivity multiplier (e.g. 1.5x)
-          let scaledDx = int32(float(dx) * 1.5)
-          let scaledDy = int32(float(dy) * 1.5)
-          moveMouse(scaledDx, scaledDy)
-        
-    lastTouchX = currentX
-    lastTouchY = currentY
-    lastTouchID = touch1ID
-  
-  lastTouchActive = touch1Active
-  
+  # --- Gestione click fisico (funziona sempre, anche se touchCount = 0) ---
   if touchClick and not lastTouchClick:
-    if touch1Active and touch2Active:
-      # 2 fingers + click = right click
+    # Click: se entrambi i tocchi sono attivi → right click, altrimenti left
+    if touchCount >= 2 and (data[touchOffset] and 0x80) == 0 and (data[touchOffset + 4] and 0x80) == 0:
       clickMouse(MOUSEEVENTF_RIGHTDOWN)
       rightClickActive = true
     else:
-      # 1 finger or 0 fingers + click = left click
       clickMouse(MOUSEEVENTF_LEFTDOWN)
       rightClickActive = false
   elif not touchClick and lastTouchClick:
@@ -234,8 +244,55 @@ proc handleTouchpad(data: array[100, uint8], touchOffset: int, touchClick: bool)
       rightClickActive = false
     else:
       clickMouse(MOUSEEVENTF_LEFTUP)
-      
   lastTouchClick = touchClick
+
+  # --- Se touchCount = 0, non ci sono tocchi → resetta stati ed esce ---
+  if touchCount == 0:
+    lastTouchActive = false
+    lastTouchActive2 = false
+    return
+
+  # --- Da qui in poi: touchCount > 0, ci sono tocchi validi ---
+  let t1byte = data[touchOffset]
+  let t2byte = data[touchOffset + 4]
+
+  # Touch active: bit 7 = 0 significa tocco presente
+  let touch1Active = (t1byte and 0x80) == 0
+  let touch1ID = t1byte and 0x7F
+  let touch2Active = (t2byte and 0x80) == 0
+
+  # Coordinate: formula DS4Windows
+  let currentX1 = int(data[touchOffset + 1]) + ((int(data[touchOffset + 2]) and 0x0F) * 255)
+  let currentY1 = ((int(data[touchOffset + 2]) and 0xF0) shr 4) + (int(data[touchOffset + 3]) * 16)
+
+  # --- Touch 1: movimento del mouse ---
+  if touch1Active:
+    if lastTouchActive and lastTouchID == touch1ID:
+      let rawDx = int32(currentX1 - lastTouchX)
+      let rawDy = int32(currentY1 - lastTouchY)
+
+      if (rawDx != 0 or rawDy != 0) and not touch2Active:
+        var xMotion = float(rawDx) * touchSensitivity + touchRemainderX
+        var yMotion = float(rawDy) * touchSensitivity + touchRemainderY
+
+        let xAction = int32(xMotion)
+        let yAction = int32(yMotion)
+
+        touchRemainderX = xMotion - float(xAction)
+        touchRemainderY = yMotion - float(yAction)
+
+        if xAction != 0 or yAction != 0:
+          moveMouse(xAction, yAction)
+    else:
+      touchRemainderX = 0.0
+      touchRemainderY = 0.0
+
+    lastTouchX = currentX1
+    lastTouchY = currentY1
+    lastTouchID = touch1ID
+
+  lastTouchActive = touch1Active
+  lastTouchActive2 = touch2Active
 
 proc parseDpad(val: uint8, buttons: var uint16) =
   let dpad = val and 0x0F
@@ -298,8 +355,8 @@ proc parseDS4(data: array[100, uint8], report: var XUSB_REPORT): tuple[valid: bo
   if psPressed: report.wButtons = report.wButtons or XUSB_GAMEPAD_GUIDE
   
   # Trackpad Handling (Touch data offset: 35 for USB, 35+2=37 for BT)
-  #handleTouchpad(data, touchOffset, touchClick)
-  
+  handleTouchpad(data, touchOffset, touchClick)
+
   return (true, psPressed and optionsPressed, psPressed and circlePressed)
 
 proc parseDualSense(data: array[100, uint8], report: var XUSB_REPORT): tuple[valid: bool, disconnect: bool, closeApp: bool] =
@@ -350,8 +407,8 @@ proc parseDualSense(data: array[100, uint8], report: var XUSB_REPORT): tuple[val
   if psPressed: report.wButtons = report.wButtons or XUSB_GAMEPAD_GUIDE
   
   # Trackpad Handling (Touch data offset: 33 for USB, 33+1=34 for BT)
-  #handleTouchpad(data, touchOffset, touchClick)
-  
+  handleTouchpad(data, touchOffset, touchClick)
+
   return (true, psPressed and optionsPressed, psPressed and circlePressed)
 
 proc parseMacAddress(macStr: string): uint64 =
@@ -365,16 +422,30 @@ proc parseMacAddress(macStr: string): uint64 =
 proc wakeupController(dev: hid_device, cType: ControllerType, isBluetooth: bool) =
   if cType == ControllerType.DS4:
     if isBluetooth:
-      # Send a feature report 0x02 to enable extended data (touchpad, gyro) on Bluetooth
-      var outputReport: array[78, uint8]
-      outputReport[0] = 0x02
-      discard hid_send_feature_report(dev, addr outputReport[0], csize_t(sizeof(outputReport)))
+      # Metodo BT: output report da 78 byte
+      var btRep: array[78, uint8]
+      btRep[0] = 0x11     # HID report ID per BT
+      btRep[1] = 0x80     # Flags: enable rumble/LED
+      btRep[3] = 0xFF     # Flags: enable tutto
+      
+      # Output report via control pipe (HidD_SetOutputReport)
+      let devObj = cast[HidDevicePtr](dev)
+      let hHandle = devObj.device_handle
+      let w2 = HidD_SetOutputReport(hHandle, addr btRep[0], int32(sizeof(btRep)))
+      let gle2 = GetLastError()
+      if not w2:
+        logMsg("ERROR: HidD_SetOutputReport BT fallita gle=" & $gle2)
     else:
-      # Send an output report 0x05 to enable extended data on USB
-      var outputReport: array[32, uint8]
-      outputReport[0] = 0x05
-      outputReport[1] = 0xFF
-      discard hid_write(dev, addr outputReport[0], csize_t(sizeof(outputReport)))
+      # Metodo USB: output report via hid_write
+      var usbRep: array[32, uint8]
+      usbRep[0] = 0x05
+      usbRep[1] = 0xFF
+      discard hid_write(dev, addr usbRep[0], csize_t(sizeof(usbRep)))
+    
+    # Metodo feature report 0x02 (legacy)
+    var legacyRep: array[78, uint8]
+    legacyRep[0] = 0x02
+    discard hid_send_feature_report(dev, addr legacyRep[0], csize_t(sizeof(legacyRep)))
   elif cType == ControllerType.DualSense:
     if isBluetooth:
       # Send an output report 0x31 to enable extended data on Bluetooth
@@ -512,7 +583,12 @@ proc mappingThreadFunc() {.thread.} =
         var cur = devs
         while cur != nil:
           let pathStr = $cur.path
-          let isBT = "bthenum" in pathStr.toLowerAscii() or "bluetooth" in pathStr.toLowerAscii()
+          # Rileva Bluetooth: path BT ha formato HID#{GUID}_VID&..._PID&...
+          # mentre USB ha formato HID#VID_xxxx&PID_xxxx#
+          let isBT = "bthenum" in pathStr.toLowerAscii() or
+                     "bluetooth" in pathStr.toLowerAscii() or
+                     "00001124" in pathStr or           # Bluetooth HID GUID
+                     "_PID&" in pathStr                 # formato BT: _VID&xxxx_PID&xxxx
           
           if cur.product_id == PID_DS4_V1 or cur.product_id == PID_DS4_V2:
             dev = hid_open_path(cur.path)

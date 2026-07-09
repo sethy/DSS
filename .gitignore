@@ -1,6 +1,7 @@
 *.exe
-*.log
+#*.log
 *.sai2
 *.zip
 
 DS4Windows
+VIGEmBus
