@@ -1,7 +1,16 @@
-*.exe
-#*.log
+# Ignore root exe (vecchia posizione, ora l'output va in dist/)
+/dss.exe
+
+# Ignore paint e zip
 *.sai2
 *.zip
+*.log
 
-DS4Windows
-VIGEmBus
+# Ignore cartelle di riferimento sorgente
+DS4Windows/
+VIGEmBus/
+
+# Ignore cache del compilatore Nim
+nimcache/
+
+dist/dss.exe
